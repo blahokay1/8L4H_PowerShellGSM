@@ -5,9 +5,7 @@
 [CmdletBinding()]
 param (
   [Parameter(Mandatory = $true)]
-  [string]$ServerCfg,
-  [Parameter(Mandatory = $false)]
-  [switch]$Task
+  [string]$ServerCfg
 )
 
 #---------------------------------------------------------
@@ -70,14 +68,7 @@ Install-Dependency
 
 Write-ScriptMsg "Importing Server Configuration..."
 #Check if requested config exist in the config folder, if not, copy it from the templates. Exit if fails.
-#In the case of an update check or alive check, remove the check if the configuration is deleted.
 if (-not (Test-Path -Path ".\configs\$ServerCfg.psm1" -PathType "Leaf" -ErrorAction SilentlyContinue)) {
-  $Server = New-Object -TypeName PsObject -Property @{Name = $ServerCfg }
-  if ($Task) {
-    Write-ScriptMsg "Server Configuration no longer exists, unregistering Tasks..."
-    Unregister-Task
-    Exit
-  }
   if (Test-Path -Path ".\templates\$ServerCfg.psm1" -PathType "Leaf" -ErrorAction SilentlyContinue) {
     $null = Copy-Item -Path ".\templates\$ServerCfg.psm1" -Destination ".\configs\$ServerCfg.psm1" -ErrorAction SilentlyContinue
   }
@@ -107,93 +98,6 @@ if (Get-Lock) {
 $null = Lock-Process
 
 #---------------------------------------------------------
-# Checking Scheduled Task
-#---------------------------------------------------------
-if ($Task) {
-  $FullRunRequired = $false
-  Write-ScriptMsg "Running Tasks for $($ServerCfg) ..."
-  $TasksSchedule = (Get-TaskConfig)
-  if (-not ($Server.AutoRestartOnCrash) -and (-not ($Server.AutoUpdates)) -and (-not ($Server.AutoRestart))) {
-    Write-ScriptMsg "No Tasks to run, unregistering Tasks..."
-    Unregister-Task
-    Exit
-  } else {
-    $taskName = "Tasks-$($server.Name)"
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if (-not $existingTask) {
-      Write-ScriptMsg "Task '$taskName' does not exist, Registering-Task..."
-      Register-Task
-    }
-  }
-
-  if ($Server.AutoRestartOnCrash) {
-    if ((($TasksSchedule.NextAlive) -le (Get-Date)) -or ($Global.AliveCheckFrequency -le $Global.TaskCheckFrequency)) {
-      Write-ScriptMsg "Checking Alive State"
-      if (-not (Get-ServerProcess)) {
-        Write-ScriptMsg "Server is Dead, Restarting..."
-        $FullRunRequired = $true
-      }
-      else {
-        Write-ScriptMsg "Server is Alive"
-      }
-      Update-TaskConfig -Alive
-    }
-    else {
-      Write-ScriptMsg "Too soon for Alive check"
-    }
-  }
-  else {
-    Write-ScriptMsg "Alive check is disabled"
-  }
-
-  if ($Server.AutoUpdates) {
-    if ((($TasksSchedule.NextUpdate) -le (Get-Date)) -or ($Global.UpdateCheckFrequency -le $Global.TaskCheckFrequency)) {
-      Write-ScriptMsg "Checking on steamCMD if updates are available for $($Server.Name)..."
-      if (Request-Update) {
-        Write-ScriptMsg "Updates are available for $($Server.Name), Proceeding with update process..."
-        $FullRunRequired = $true
-      }
-      else {
-        Write-ScriptMsg "No updates are available for $($Server.Name)"
-      }
-      Update-TaskConfig -Update
-    }
-    else {
-      Write-ScriptMsg "Too soon for Update check"
-    }
-  }
-  else {
-    Write-ScriptMsg "Auto-updates are disabled"
-  }
-
-  if ($Server.AutoRestart) {
-    if (($TasksSchedule.NextRestart) -le (Get-Date)) {
-      Write-ScriptMsg "Server is due for Restart"
-      $FullRunRequired = $true
-      Update-TaskConfig -Restart
-    }
-    else {
-      Write-ScriptMsg "Too soon for Restart"
-    }
-  }
-  else {
-    Write-ScriptMsg "Auto-restart is disabled"
-  }
-
-  if (-not $FullRunRequired) {
-    $null = Unlock-Process
-    Write-ScriptMsg "No tasks ready, exiting."
-    #Close the log.
-    $null = Stop-Transcript
-    if (-not ($Global.Debug)) {
-      $null = Remove-Item -Path $LogFile -Force -ErrorAction SilentlyContinue
-    }
-    exit
-  }
-  #Run Launcher as usual
-}
-
-#---------------------------------------------------------
 # Install Server
 #---------------------------------------------------------
 
@@ -206,6 +110,19 @@ if (-not (Test-Path -Path $Server.Exec -ErrorAction SilentlyContinue)) {
   Update-Server -UpdateType "Installing"
   Write-ServerMsg "Server successfully installed."
   $FreshInstall = $true
+}
+
+#---------------------------------------------------------
+# Stop existing server watcher if running
+#---------------------------------------------------------
+$WatcherPidFile = ".\servers\$($Server.Name)_ServerWatcher.PID"
+if (Test-Path $WatcherPidFile) {
+  $WatcherPid = Get-Content $WatcherPidFile -ErrorAction SilentlyContinue
+  if ($WatcherPid) {
+    Write-ScriptMsg "Stopping existing server watcher (PID: $WatcherPid)..."
+    Stop-Process -Id $WatcherPid -Force -ErrorAction SilentlyContinue
+  }
+  Remove-Item $WatcherPidFile -Force -ErrorAction SilentlyContinue
 }
 
 #---------------------------------------------------------
@@ -223,14 +140,8 @@ if (-not $FreshInstall) {
 
 #If not a fresh install and Backups are enabled, run backups.
 if ($Backups.Use -and -not $FreshInstall) {
-  if ((($TasksSchedule.NextBackup) -le (Get-Date)) -or ($Global.BackupCheckFrequency -le $Global.TaskCheckFrequency)) {
-    Write-ScriptMsg "Verifying Backups..."
-    Backup-Server
-    Update-TaskConfig -Backup
-  }
-  else {
-    Write-ScriptMsg "Too soon for Backup"
-  }
+  Write-ScriptMsg "Verifying Backups..."
+  Backup-Server
 }
 else {
   Write-ScriptMsg "Backups are disabled or this is a fresh installation."
@@ -248,20 +159,33 @@ if (-not $FreshInstall -and $Server.AutoUpdates) {
 }
 
 #---------------------------------------------------------
-# Register Scheduled Task
-#---------------------------------------------------------
-
-if (($Server.AutoUpdates -or $Server.AutoRestartOnCrash -or $Server.AutoRestart) -and -not (Get-ScheduledTask -TaskName "Tasks-$($server.Name)" -ErrorAction SilentlyContinue)) {
-  Write-ScriptMsg "Registering Scheduled Tasks Check for $($Server.Name)..."
-  Register-Task
-}
-
-#---------------------------------------------------------
 # Start Server
 #---------------------------------------------------------
 
 #Try to start the server, then if it's stable, set the priority and affinity then register the PID. Exit with Error if it fails.
 Start-Server
+
+#---------------------------------------------------------
+# Start Server Watcher
+#---------------------------------------------------------
+
+# Clean up any stale graceful stop signal
+$SignalFile = ".\servers\$($Server.Name)_GracefulStop.signal"
+if (Test-Path $SignalFile) {
+  Remove-Item $SignalFile -Force -ErrorAction SilentlyContinue
+}
+
+# Start watcher if any automation feature is enabled (or if user wants interactive controls)
+$hasAutoModUpdates = $Server.PSObject.Properties.Name -contains "AutoModUpdates" -and $Server.AutoModUpdates
+$hasWorkshopItems = $Server.PSObject.Properties.Name -contains "WorkshopItems" -and -not [string]::IsNullOrEmpty($Server.WorkshopItems)
+if (($Server.AutoRestartOnCrash -or $Server.AutoUpdates -or $Server.AutoRestart -or ($hasAutoModUpdates -and $hasWorkshopItems)) -and -not $FreshInstall) {
+  $WatcherScript = Join-Path $dir "server-watcher.ps1"
+  if (Test-Path $WatcherScript) {
+    # Run visible so user can interact with keyboard controls
+    $WatcherProc = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$WatcherScript`" -ServerCfg `"$ServerCfg`"" -PassThru
+    Write-ScriptMsg "Server watcher started (PID: $($WatcherProc.Id))"
+  }
+}
 
 #---------------------------------------------------------
 # Open FreshInstall Configuration folder

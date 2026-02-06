@@ -1,4 +1,9 @@
 function Stop-Server {
+  # Create graceful stop signal for the watcher
+  # This tells the watcher that this is an intentional stop, not a crash
+  $SignalFile = ".\servers\$($Server.Name)_GracefulStop.signal"
+  "Graceful stop initiated at $(Get-Date)" | Out-File -FilePath $SignalFile -Force
+
   $ServerProcess = Get-ServerProcess
   #Check if the process was found.
   if (-not ($ServerProcess)) {

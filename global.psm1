@@ -15,7 +15,13 @@ $GlobalDetails = @{
   LogFolder            = ".\logs"
 
   #File extensions to exclude from backups
-  Exclusions           = @(".tmp", ".bak", ".log", ".old", ".temp", ".backup")
+  Exclusions           = @(
+    ".tmp", ".bak", ".log", ".old", ".temp", ".backup",
+    ".dmp",        # Crash dumps
+    ".cache",      # Cache files
+    "thumbs.db",   # Windows thumbnail cache
+    ".DS_Store"    # macOS metadata
+  )
 
   #Number of days to keep server logs
   Days                 = 30
@@ -41,17 +47,11 @@ $GlobalDetails = @{
   #Pause on errors
   PauseOnErrors        = $false
 
-  #Backup Frequency in Minutes
-  BackupCheckFrequency = 60
-
-  #Check for Update Frequency in Minutes
+  #Check for Update Frequency in Minutes (used by server-watcher.ps1)
   UpdateCheckFrequency = 15
 
-  #Check if the server is alive Frequency in Minutes
-  AliveCheckFrequency  = 5
-
-  #Should be lower or equal to the two above. If you change this value, you need to manually update your exsiting task in the task scheduler.s
-  TaskCheckFrequency   = 5
+  #Check for Workshop Mod Updates Frequency in Minutes (used by server-watcher.ps1)
+  ModCheckFrequency    = 30
 
   #Lock Timeout in minutes
   LockTimeout          = 120

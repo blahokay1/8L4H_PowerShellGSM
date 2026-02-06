@@ -12,8 +12,8 @@ PowerShellGSM is a comprehensive PowerShell tool for automated game server manag
 
 - `main.ps1` - Main entry point that orchestrates the entire server lifecycle
   - Imports `global.psm1` (global configuration) and all functions from `functions/` subdirectories
-  - Takes `-ServerCfg` (server name) and optional `-Task` (scheduled task mode) parameters
-  - Execution flow: Import modules → Start logging → Import server config → Check/Install → Stop → Backup → Update → Start → Register scheduled tasks
+  - Takes `-ServerCfg` (server name) parameter
+  - Execution flow: Import modules → Start logging → Import server config → Check/Install → Stop → Backup → Update → Start → Spawn server watcher
 
 ### Configuration System
 
@@ -40,23 +40,31 @@ Functions are organized by category in `functions/` subdirectories:
 The system uses file-based locking (`Get-Lock`, `Lock-Process`, `Unlock-Process`) to prevent concurrent execution:
 - Lock files stored in `.\locks\$ServerCfg.lock`
 - Contains timestamp to detect stale locks (timeout: 120 minutes default)
-- Prevents conflicts between manual runs and scheduled task checks
+- Prevents conflicts between manual runs and watcher-triggered restarts
 
-### Scheduled Task System
+### Server Watcher System
 
-Two-tier task system:
-1. **Initial Run**: User executes `launchers/*.cmd` which calls `main.ps1`
-2. **Scheduled Tasks**: Created via `Register-Task` to run `main.ps1 -Task` every N minutes (default: 5)
+The server watcher (`server-watcher.ps1`) is a background process that monitors the server and triggers restarts when needed:
 
-The `-Task` parameter triggers periodic checks:
-- **Alive Check**: Verifies server process exists, restarts if crashed (AutoRestartOnCrash)
-- **Update Check**: Queries SteamCMD for updates (AutoUpdates)
-- **Auto Restart**: Scheduled daily restart at configured time (AutoRestart)
-- **Backup Check**: Creates backups on configured frequency
+1. **Launch**: After `main.ps1` starts the server, it spawns the watcher as a hidden background process
+2. **Monitoring Loop**: The watcher checks every minute for various conditions:
+   - **Alive Check**: Verifies server process exists, triggers restart if crashed (`AutoRestartOnCrash`)
+   - **Update Check**: Every `UpdateCheckFrequency` minutes, queries SteamCMD for updates (`AutoUpdates`)
+   - **Auto Restart**: Triggers restart at configured daily time (`AutoRestart` + `AutoRestartTime`)
+   - **Mod Update Check**: Every `ModCheckFrequency` minutes, queries Steam Workshop API (`AutoModUpdates`)
+3. **Restart Trigger**: When any check detects a restart is needed, the watcher invokes `main.ps1` and exits
+4. **Fresh Watcher**: The new `main.ps1` instance spawns a fresh watcher after starting the server
 
-Each check has a frequency setting in `global.psm1` and a "next run" timestamp tracked in `.\servers\$ServerCfg.INI`.
+**Key Files**:
+- `.\servers\<ServerName>_ServerWatcher.PID` - PID file for watcher process management
+- `.\logs\server-watcher-<ServerName>.txt` - Watcher log file (append mode)
 
-**CRITICAL TIMING BUG FIX**: The variable `$TasksSchedule` (loaded via `Get-TaskConfig`) must be initialized BEFORE the `if ($Task)` block in `main.ps1`. This ensures backup frequency checking works correctly for both manual launches and scheduled task mode. If `$TasksSchedule` is only loaded inside the task mode block, manual launches will create backups every time instead of respecting the configured frequency.
+**Watcher Spawn Condition**: The watcher is spawned if any automation feature is enabled:
+```powershell
+if ($Server.AutoRestartOnCrash -or $Server.AutoUpdates -or $Server.AutoRestart -or ($hasAutoModUpdates -and $hasWorkshopItems)) {
+  # Spawn server-watcher.ps1
+}
+```
 
 ### Backup System
 
@@ -68,8 +76,7 @@ Intelligent backup system (`Backup-Server.psm1`):
   - Compression levels: None, Fast, Low, Normal, High, Ultra
   - 7z format supports LZMA2 compression method for optimal game save compression
 - **Temp Directory Strategy**: Creates temp dir, copies filtered files preserving structure, compresses, then deletes temp dir
-- **Scheduling**: Backups only run during manual launches (not in scheduled task mode), respecting `$Global.BackupCheckFrequency` interval
-- **Next Run Tracking**: Uses `servers\$ServerName.INI` to track when next backup should run
+- **Scheduling**: Backups run on every server start (not during watcher-triggered restarts for crashes)
 
 **Configurable Backup Compression** (optional settings in `$BackupsDetails`):
 ```powershell
@@ -104,6 +111,10 @@ Default behavior (if not specified): Fast compression with ZIP format for backwa
 - Uses SteamCMD with `app_update`, optional beta branch, and `validate` flag
 - Only runs when not a fresh install and AutoUpdates enabled
 
+### Runtime Properties
+
+`$Global.InternalIP` and `$Global.ExternalIP` are added dynamically at runtime by `Set-IP` (in `functions/network/`). They are NOT defined in `global.psm1` but are available in templates' `Start-ServerPrep` functions and argument lists. `InternalIP` is detected from the active network interface; `ExternalIP` is fetched from `ifconfig.me`.
+
 ### Remote Management
 
 `Send-Command` function supports multiple protocols for server control:
@@ -126,11 +137,8 @@ Each protocol sends commands (broadcast messages, save, shutdown) configured in 
 ### Manual Server Operations
 
 ```powershell
-# Install/Update/Start a server
+# Install/Update/Start a server (also spawns background watcher)
 .\main.ps1 -ServerCfg "icarus"
-
-# Run scheduled task checks (update/alive/restart checks)
-.\main.ps1 -ServerCfg "icarus" -Task
 ```
 
 ### Creating a New Game Server Configuration
@@ -154,33 +162,6 @@ Install-Module -Name PSScriptAnalyzer -Scope CurrentUser
 # Run analyzer on a file
 Invoke-ScriptAnalyzer -Path .\path\to\file.ps1 -Settings .\.vscode\PSScriptAnalyzerSettings.psd1
 ```
-
-## System Requirements
-
-- Windows 10 or Windows Server 2016 or newer
-- PowerShell 5.1 or higher
-- User account should have admin privileges but **should not** run scripts elevated (as admin)
-- Not recommended for primary gaming computers due to scheduled task popups (unless monitoring features are disabled)
-
-**Common Game Server Dependencies** (may be required depending on game):
-- DirectX End-User Runtime
-- Microsoft Visual C++ Redistributable
-- .NET Framework 4.8.1
-- .NET Framework 5/6/7/8
-- Java JDK (for Java-based servers)
-- Microsoft XNA Redistributable
-
-**Optional Performance Improvement**:
-```powershell
-Install-Module -Name 7Zip4Powershell  # Faster backup compression
-```
-
-## Key Configuration Files
-
-- `global.psm1` - Global settings (paths to tools, check frequencies, colors, backup exclusions)
-- `configs/*.psm1` - Server-specific configurations (copied from templates on first run)
-- `servers/*.INI` - Task scheduling state (next backup/update/restart/alive times)
-- `locks/*.lock` - Process lock files with timestamps to prevent concurrent execution
 
 ## Important Patterns
 
@@ -224,10 +205,13 @@ The system supports two types of configuration files:
 - Automatically handles type detection (strings, numbers, booleans)
 - Preserves Lua formatting and indentation
 
-**Template Backup Pattern**:
-- After applying settings from the .psm1 config to game files, create a `*_template.ini` or `*_template.lua` backup
-- Only create template backup if it doesn't already exist (`if (-not (Test-Path $TemplateFile))`)
-- This preserves the configured state as a reference and prevents overwriting user customizations
+**Reference Template Pattern** (Project Zomboid):
+- Template files (`*_template.ini`, `*_SandboxVars_template.lua`) are **reference examples** only
+- Generated from .psm1 configuration variables to show recommended settings
+- **Never written to actual game config files** - user manually copies desired settings
+- Automatically regenerated when .psm1 config file is modified (based on file modification time)
+- Users review templates and selectively apply settings to their game configs
+- This gives users full control over game configuration while providing helpful examples
 
 **Project Zomboid Mod Configuration**:
 Project Zomboid has specific format requirements for mod configuration:
@@ -285,17 +269,6 @@ Each `.psm1` file exports specific functions/variables:
   - Project Zomboid also exports `"Sandbox"`: `Export-ModuleMember -Variable @("Server", "Backups", "Warnings", "Sandbox")`
 - Global module: `Export-ModuleMember -Variable "Global"`
 
-## Task Scheduler Integration
-
-Tasks are created with:
-- Daily trigger at midnight
-- Repetition interval of 5 minutes (or `$Global.TaskCheckFrequency`)
-- 3-hour execution time limit
-- Hidden window execution
-- Task name: `Tasks-$ServerName`
-
-Tasks are automatically unregistered if all automation features (AutoUpdates, AutoRestartOnCrash, AutoRestart) are disabled.
-
 ## Two-Phase First Launch
 
 When setting up a new server, the first launch follows a two-phase process:
@@ -309,9 +282,99 @@ When setting up a new server, the first launch follows a two-phase process:
 **Phase 2 - First Start**:
 1. User runs the same launcher again
 2. Script starts the server with user's configurations
-3. Script creates Windows scheduled task for monitoring
+3. Script spawns background server watcher for monitoring
 
 This pause after installation is intentional - game servers require configuration before first start.
+
+## Template Skeleton
+
+Concise reference for creating new game server templates (`templates/<game>.psm1`):
+
+```powershell
+$Name = $ServerCfg
+
+$ServerDetails = @{
+  # SteamCMD login
+  Login              = "anonymous"
+  # Game-specific settings (name, ports, passwords, etc.)
+  ServerName         = "My Server"
+  Port               = 27015
+  ManagementIP       = "127.0.0.1"   # RCON IP (or placeholder if unsupported)
+  ManagementPort     = ""
+  ManagementPassword = ""
+  # Installation details
+  Name               = $Name
+  Path               = ".\servers\$Name"
+  ConfigFolder       = ".\servers\$Name"
+  AppID              = 0              # Steam dedicated server App ID
+  BetaBuild          = ""
+  BetaBuildPassword  = ""
+  # Automation
+  AutoUpdates        = $true
+  AutoModUpdates     = $false         # Steam Workshop mod update checking (requires WorkshopItems)
+  AutoRestartOnCrash = $true
+  AutoRestart        = $true
+  AutoRestartTime    = @(3, 0, 0)     # Hour, Minute, Seconds
+  # Process
+  ProcessName        = "ServerExecutable"
+  UsePID             = $true
+  Exec               = ".\servers\$Name\ServerExecutable.exe"
+  AllowForceClose    = $true          # Required if no RCON
+  UsePriority        = $true
+  AppPriority        = "High"
+  UseAffinity        = $false
+  AppAffinity        = 15
+  Validate           = $true
+  StartupWaitTime    = 10
+}
+$Server = New-Object -TypeName PsObject -Property $ServerDetails
+
+$BackupsDetails = @{
+  Use        = $true
+  Path       = ".\backups\$($Server.Name)"
+  Days       = 7
+  Weeks      = 4
+  Saves      = ".\servers\$($Server.Name)\savedata"
+  Exclusions = ""                     # Regex with | separator
+}
+$Backups = New-Object -TypeName PsObject -Property $BackupsDetails
+
+$WarningsDetails = @{
+  Use        = $false                 # $true if RCON/Telnet/Websocket supported
+  Protocol   = "RCON"                 # RCON, ARRCON, Telnet, Websocket
+  Timers     = [System.Collections.ArrayList]@(240, 50, 10)
+  MessageMin = "The server will restart in % minutes !"
+  MessageSec = "The server will restart in % seconds !"
+  CmdMessage = "say"
+  CmdSave    = "save"
+  SaveDelay  = 15
+  CmdStop    = "shutdown"
+}
+$Warnings = New-Object -TypeName PsObject -Property $WarningsDetails
+
+$ArgumentList = @(
+  "-batchmode ",                      # Trailing space on each element
+  "-port $($Server.Port) "
+)
+# Conditional arguments (pattern from ark_survival_ascended.psm1):
+# if ($Server.OptionalField -ne "") { $ArgumentList += "-flag $($Server.OptionalField) " }
+
+Add-Member -InputObject $Server -Name "ArgumentList" -Type NoteProperty -Value $ArgumentList
+Add-Member -InputObject $Server -Name "Launcher" -Type NoteProperty -Value "$($Server.Exec)"
+Add-Member -InputObject $Server -Name "WorkingDirectory" -Type NoteProperty -Value "$($Server.Path)"
+
+function Start-ServerPrep {
+  Write-ScriptMsg "Port Forward : $($Server.Port) in TCP and UDP to $($Global.InternalIP)"
+}
+
+Export-ModuleMember -Function Start-ServerPrep -Variable @("Server", "Backups", "Warnings")
+```
+
+Each template also needs a matching launcher in `launchers/<game>.cmd`:
+```batch
+cd ..
+start powershell.exe -noprofile -executionpolicy bypass -file ".\main.ps1" -ServerCfg "%~n0"
+```
 
 ## Troubleshooting
 
@@ -324,7 +387,32 @@ This pause after installation is intentional - game servers require configuratio
 - Default timeout is 120 minutes; old locks are auto-removed after timeout
 - Manual fix: delete the `.lock` file for the affected server
 
-**Scheduled Task Popups**: Brief CMD window flashes every 5 minutes on desktop:
-- Expected on workstations (not dedicated servers)
-- Disable monitoring: Set `AutoUpdates`, `AutoRestartOnCrash`, and `AutoRestart` to `$false` in server config
-- Or disable/delete the scheduled task in Windows Task Scheduler
+## Workshop Mod Update Checking
+
+For games with Steam Workshop support (currently Project Zomboid), the server watcher can automatically detect mod updates and trigger a server restart.
+
+### Configuration
+
+**Global setting** (in `global.psm1`):
+```powershell
+ModCheckFrequency = 30  # Minutes between Steam Workshop API checks
+```
+
+**Per-server settings** (in server config `.psm1`):
+```powershell
+AutoModUpdates = $true   # Enable mod update watching
+WorkshopItems  = "2256623447;2920899878;"  # Steam Workshop IDs (semicolon-separated)
+```
+
+### Files Created
+
+- `.\servers\<ServerName>_ModTimestamps.INI` - Stores last-known update timestamps per mod
+
+### Key Functions
+
+- `Request-ModUpdate` (in `functions/server/`) - Queries Steam API and compares timestamps
+- `server-watcher.ps1` - Comprehensive background monitoring script (handles all automation)
+
+### First-Check Behavior
+
+When checking a mod for the first time (no stored timestamp), the watcher records the current timestamp but does NOT trigger a restart. This prevents a false-positive restart when enabling the feature on an existing server with mods already installed.

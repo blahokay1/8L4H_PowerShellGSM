@@ -35,7 +35,6 @@ function Start-Server {
     else {
       $null = Set-Priority -ServerProcess $ServerProcess
     }
-    $null = Register-TaskConfig
   }
   catch {
     Write-Error $_
