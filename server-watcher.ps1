@@ -33,11 +33,21 @@ Set-Location -Path $dir
 # Import Server Config
 #---------------------------------------------------------
 
+# Import the server configuration module (creates $Server, $Backups, $Warnings)
+try {
+  Import-Module -Name ".\configs\$ServerCfg.psm1"
+}
+catch {
+  Write-Host "Server Watcher: Unable to import config module for $ServerCfg, exiting."
+  Exit 1
+}
+
+# Parse configuration (resolve paths, build arguments)
 try {
   Read-Config
 }
 catch {
-  Write-Host "Server Watcher: Unable to read config for $ServerCfg, exiting."
+  Write-Host "Server Watcher: Unable to parse config for $ServerCfg, exiting."
   Exit 1
 }
 
